@@ -51,6 +51,19 @@ def assay_consistency_loss(
     return masked_huber(pred_assays, observed_assays, mask=mask, delta=delta)
 
 
+def block_consistency_loss(
+    generated_nodes: torch.Tensor,
+    observed_blocks: torch.Tensor,
+    block_operator: torch.Tensor,
+    mask: torch.Tensor | None = None,
+    delta: float = 1.0,
+) -> torch.Tensor:
+    """Compare generated microfield/node values with observed block averages."""
+
+    pred_blocks = apply_operator(block_operator, generated_nodes)
+    return masked_huber(pred_blocks, observed_blocks, mask=mask, delta=delta)
+
+
 def prior_residual_loss(
     residual: torch.Tensor,
     confidence: torch.Tensor | None = None,
@@ -63,4 +76,3 @@ def prior_residual_loss(
             confidence = confidence.unsqueeze(-1)
         loss = loss * confidence.to(loss.dtype)
     return loss.mean()
-

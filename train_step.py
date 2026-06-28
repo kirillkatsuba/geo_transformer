@@ -4,7 +4,7 @@ import torch
 
 from .config import TrainingConfig
 from .losses import assay_consistency_loss, gaussian_nll, prior_residual_loss
-from .model import GeoTransformer
+from .model import GeoTransformer, shift_targets_right
 
 
 def training_step(
@@ -21,9 +21,35 @@ def training_step(
     is added when computing assay consistency.
     """
 
+    prev_targets = batch["prev_targets"]
+    if config.context_dropout > 0:
+        keep = torch.rand(prev_targets.shape[:2], device=prev_targets.device) >= config.context_dropout
+        prev_targets = prev_targets * keep.unsqueeze(-1).to(prev_targets.dtype)
+
+    if config.scheduled_sampling_prob > 0:
+        with torch.no_grad():
+            warm_mu, _ = model(
+                conditions=batch["conditions"],
+                prev_targets=prev_targets,
+                assay_tokens=assay_tokens,
+                attention_mask=batch["attention_mask"],
+            )
+            generated_targets = batch["baseline"] + warm_mu
+            generated_prev = shift_targets_right(generated_targets)
+            use_generated = (
+                torch.rand(prev_targets.shape[:2], device=prev_targets.device)
+                < config.scheduled_sampling_prob
+            )
+            use_generated[:, 0] = False
+            prev_targets = torch.where(
+                use_generated.unsqueeze(-1),
+                generated_prev,
+                prev_targets,
+            )
+
     mu, log_sigma = model(
         conditions=batch["conditions"],
-        prev_targets=batch["prev_targets"],
+        prev_targets=prev_targets,
         assay_tokens=assay_tokens,
         attention_mask=batch["attention_mask"],
     )
@@ -55,4 +81,3 @@ def training_step(
         losses["assay"] = assay_loss.detach()
 
     return losses
-

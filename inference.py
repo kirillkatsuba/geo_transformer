@@ -32,6 +32,9 @@ def generate_autoregressive(
     conditions = conditions.to(device)
     order = order.to(device)
     ordered_conditions = conditions[order].unsqueeze(0)
+    ordered_baseline = None
+    if baseline is not None:
+        ordered_baseline = baseline.to(device)[order].unsqueeze(0)
 
     n_nodes = ordered_conditions.size(1)
     target_dim = model.config.target_dim
@@ -58,17 +61,18 @@ def generate_autoregressive(
         mu_i = mu[:, -1]
         if log_sigma is not None and sample:
             eps = torch.randn_like(mu_i)
-            y_i = mu_i + torch.exp(log_sigma[:, -1]) * eps * temperature
+            residual_i = mu_i + torch.exp(log_sigma[:, -1]) * eps * temperature
         else:
-            y_i = mu_i
+            residual_i = mu_i
+        if ordered_baseline is not None:
+            y_i = residual_i + ordered_baseline[:, pos]
+        else:
+            y_i = residual_i
         generated_ordered[:, pos] = y_i
 
     generated = torch.zeros_like(generated_ordered)
     generated[:, order] = generated_ordered
-    generated = generated.squeeze(0)
-    if baseline is not None:
-        generated = generated + baseline.to(device)
-    return generated
+    return generated.squeeze(0)
 
 
 @torch.no_grad()

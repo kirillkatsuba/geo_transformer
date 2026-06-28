@@ -10,6 +10,8 @@ from .data import BLOCK_SIZE_COLUMNS, COORD_COLUMNS, TARGET_COLUMNS
 
 DEFAULT_NUMERIC_FEATURES = [
     *COORD_COLUMNS,
+    "coord_strike",
+    "coord_cross",
     *BLOCK_SIZE_COLUMNS,
     "Au_Final",
     "volume",
@@ -47,7 +49,19 @@ class GeoFeatureBuilder:
     output_columns_: list[str] = field(default_factory=list)
 
     def fit(self, df: pd.DataFrame) -> "GeoFeatureBuilder":
-        numeric_cols = [col for col in self.numeric_features if col in df.columns]
+        numeric_feature_set = set(self.numeric_features)
+        numeric_feature_set.update(
+            col
+            for col in df.columns
+            if col.startswith("knn_")
+            or col.startswith("baseline_")
+            or col.startswith("v1_")
+            or col.startswith("v2_")
+            or col.startswith("dnn_")
+            or col.startswith("gp_")
+            or col.startswith("ensemble_")
+        )
+        numeric_cols = [col for col in df.columns if col in numeric_feature_set]
         categorical_cols = [col for col in self.categorical_features if col in df.columns]
 
         for col in numeric_cols:
@@ -125,4 +139,3 @@ def target_matrix(df: pd.DataFrame, fill_value: float = 0.0) -> pd.DataFrame:
     """Return targets in standard order, filling missing values for tensors."""
 
     return df[TARGET_COLUMNS].apply(pd.to_numeric, errors="coerce").fillna(fill_value)
-

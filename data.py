@@ -12,6 +12,82 @@ TARGET_COLUMNS = ["AS", "S", "CORG-1", "CA", "FE"]
 COORD_COLUMNS = ["X", "Y", "Z"]
 BLOCK_SIZE_COLUMNS = ["_X", "_Y", "_Z"]
 
+ASSAY_CHEMISTRY_COLUMNS = [
+    "Ag (ME-ICP61),ppm",
+    "Al (ME-ICP61),%",
+    "As (ME-ICP61),ppm",
+    "Ba (ME-ICP61),ppm",
+    "Be (ME-ICP61),ppm",
+    "Bi (ME-ICP61),ppm",
+    "Ca (ME-ICP61),%",
+    "Cd (ME-ICP61),ppm",
+    "Co (ME-ICP61),ppm",
+    "Cr (ME-ICP61),ppm",
+    "Cu (ME-ICP61),ppm",
+    "Fe (ME-ICP61),%",
+    "Ga (ME-ICP61),ppm",
+    "K (ME-ICP61),%",
+    "La (ME-ICP61),ppm",
+    "Li (ME-ICP61),ppm",
+    "Mg (ME-ICP61),%",
+    "Mn (ME-ICP61),ppm",
+    "Mo (ME-ICP61),ppm",
+    "Na (ME-ICP61),%",
+    "Ni (ME-ICP61),ppm",
+    "P (ME-ICP61),ppm",
+    "Pb (ME-ICP61),ppm",
+    "S (ME-ICP61),%",
+    "Sb (ME-ICP61),ppm",
+    "Sc (ME-ICP61),ppm",
+    "Sn (ME-ICP61),ppm",
+    "Sr (ME-ICP61),ppm",
+    "Ti (ME-ICP61),%",
+    "V (ME-ICP61),ppm",
+    "W (ME-ICP61),ppm",
+    "Y (ME-ICP61),ppm",
+    "Zn (ME-ICP61),ppm",
+    "Sобщ (S-IR08),%",
+    "C organic (C-IR06),%",
+]
+
+ASSAY_CHEMISTRY_RENAME = {
+    "Ag (ME-ICP61),ppm": "chem_Ag",
+    "Al (ME-ICP61),%": "chem_Al",
+    "As (ME-ICP61),ppm": "chem_AS",
+    "Ba (ME-ICP61),ppm": "chem_Ba",
+    "Be (ME-ICP61),ppm": "chem_Be",
+    "Bi (ME-ICP61),ppm": "chem_Bi",
+    "Ca (ME-ICP61),%": "chem_CA",
+    "Cd (ME-ICP61),ppm": "chem_Cd",
+    "Co (ME-ICP61),ppm": "chem_Co",
+    "Cr (ME-ICP61),ppm": "chem_Cr",
+    "Cu (ME-ICP61),ppm": "chem_Cu",
+    "Fe (ME-ICP61),%": "chem_FE",
+    "Ga (ME-ICP61),ppm": "chem_Ga",
+    "K (ME-ICP61),%": "chem_K",
+    "La (ME-ICP61),ppm": "chem_La",
+    "Li (ME-ICP61),ppm": "chem_Li",
+    "Mg (ME-ICP61),%": "chem_Mg",
+    "Mn (ME-ICP61),ppm": "chem_Mn",
+    "Mo (ME-ICP61),ppm": "chem_Mo",
+    "Na (ME-ICP61),%": "chem_Na",
+    "Ni (ME-ICP61),ppm": "chem_Ni",
+    "P (ME-ICP61),ppm": "chem_P",
+    "Pb (ME-ICP61),ppm": "chem_Pb",
+    "S (ME-ICP61),%": "chem_S_meicp",
+    "Sb (ME-ICP61),ppm": "chem_Sb",
+    "Sc (ME-ICP61),ppm": "chem_Sc",
+    "Sn (ME-ICP61),ppm": "chem_Sn",
+    "Sr (ME-ICP61),ppm": "chem_Sr",
+    "Ti (ME-ICP61),%": "chem_Ti",
+    "V (ME-ICP61),ppm": "chem_V",
+    "W (ME-ICP61),ppm": "chem_W",
+    "Y (ME-ICP61),ppm": "chem_Y",
+    "Zn (ME-ICP61),ppm": "chem_Zn",
+    "Sобщ (S-IR08),%": "chem_S",
+    "C organic (C-IR06),%": "chem_CORG-1",
+}
+
 
 @dataclass(frozen=True)
 class CustomerDataPaths:
@@ -175,6 +251,10 @@ def standardize_assays(
         if col in df.columns:
             out[col] = df[col]
 
+    for source_col in ASSAY_CHEMISTRY_COLUMNS:
+        if source_col in df.columns:
+            out[ASSAY_CHEMISTRY_RENAME[source_col]] = pd.to_numeric(df[source_col], errors="coerce")
+
     out["has_targets"] = out[TARGET_COLUMNS].notna().all(axis=1)
     return out
 
@@ -298,6 +378,40 @@ def attach_baselines(
         out = out.merge(base.rename(columns=rename), on="_join_key", how="left")
 
     return out.drop(columns=["_join_key"])
+
+
+def add_pca_spatial_coordinates(
+    center_nodes: pd.DataFrame,
+    north_nodes: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Add shared PCA coordinates for strike/cross-style ordering.
+
+    The PCA basis is fitted on the combined CEN+NTH XY footprint so both
+    domains share one local coordinate system.
+    """
+
+    combined_xy = pd.concat(
+        [center_nodes[["X", "Y"]], north_nodes[["X", "Y"]]],
+        ignore_index=True,
+    ).to_numpy(dtype=float)
+    mean_xy = np.nanmean(combined_xy, axis=0)
+    centered = combined_xy - mean_xy
+    centered = centered[np.isfinite(centered).all(axis=1)]
+    if len(centered) < 2:
+        components = np.eye(2)
+    else:
+        _, _, vt = np.linalg.svd(centered, full_matrices=False)
+        components = vt[:2]
+
+    def transform(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        xy = out[["X", "Y"]].to_numpy(dtype=float) - mean_xy
+        local = xy @ components.T
+        out["coord_strike"] = local[:, 0]
+        out["coord_cross"] = local[:, 1]
+        return out
+
+    return transform(center_nodes), transform(north_nodes)
 
 
 def summarize_loaded_data(data: LoadedCustomerData) -> pd.DataFrame:

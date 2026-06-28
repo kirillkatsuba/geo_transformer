@@ -92,6 +92,37 @@ Prepare data:
 python3 -m geo_transformer.prepare_customer_data --root /Users/kirill/hse_lambda/artem_2
 ```
 
+Prepare data with KNN-projected drillhole chemistry features:
+
+```bash
+python3 -m geo_transformer.prepare_customer_data \
+  --root /Users/kirill/hse_lambda/artem_2 \
+  --output-dir /Users/kirill/hse_lambda/artem_2/geo_transformer/prepared_knn_chem \
+  --add-knn-chemistry \
+  --knn-neighbors 16 \
+  --knn-power 2
+```
+
+Prepare data with KNN chemistry and existing model predictions as baseline
+features/trends:
+
+```bash
+python3 -m geo_transformer.prepare_customer_data \
+  --root /Users/kirill/hse_lambda/artem_2 \
+  --output-dir /Users/kirill/hse_lambda/artem_2/geo_transformer/prepared_full \
+  --add-knn-chemistry \
+  --knn-neighbors 16 \
+  --knn-power 2 \
+  --baseline v1=bm_models/interolation_models/bm_v1.csv \
+  --baseline v2=bm_models/interolation_models/bm_v2.csv \
+  --baseline dnn=bm_models/interolation_models/bm_dnn.csv \
+  --baseline gp=bm_models/interolation_models/bm_gp.csv \
+  --baseline v1=bm_models/extrapolation_model/bm_v1.csv
+```
+
+The same `--baseline NAME=PATH` can be passed multiple times. Tables are
+concatenated by name and joined to CEN/NTH blocks by `X/Y/Z`.
+
 Run a small smoke training job:
 
 ```bash
@@ -119,6 +150,56 @@ python3 -m geo_transformer.train \
   --order domain_strike \
   --device auto
 ```
+
+Multi-order training with scheduled sampling:
+
+```bash
+python3 -m geo_transformer.train \
+  --prepared-dir geo_transformer/prepared_knn_chem \
+  --output-dir geo_transformer/runs/knn_chem_multi_sched \
+  --epochs 100 \
+  --sequence-length 1024 \
+  --batch-size 4 \
+  --orders domain_strike,strike,random \
+  --d-model 384 \
+  --n-heads 8 \
+  --n-layers 8 \
+  --dropout 0.15 \
+  --learning-rate 8e-5 \
+  --scheduled-sampling-prob 0.15 \
+  --context-dropout 0.05 \
+  --val-mode y_high \
+  --device cuda
+```
+
+Residual training on top of attached baseline predictions:
+
+```bash
+python3 -m geo_transformer.train \
+  --prepared-dir geo_transformer/prepared_full \
+  --output-dir geo_transformer/runs/full_multi_sched_residual \
+  --epochs 100 \
+  --sequence-length 1024 \
+  --batch-size 4 \
+  --orders domain_strike,strike,random \
+  --d-model 384 \
+  --n-heads 8 \
+  --n-layers 8 \
+  --dropout 0.15 \
+  --learning-rate 8e-5 \
+  --scheduled-sampling-prob 0.15 \
+  --context-dropout 0.05 \
+  --target-baseline mean_baselines \
+  --val-mode y_high \
+  --device cuda
+```
+
+`--target-baseline mean_baselines` averages available columns such as `v1_AS`,
+`v2_AS`, `dnn_AS`, `gp_AS` and trains the Transformer to generate the residual
+field. Without this flag those columns are used only as input features. The
+trainer applies a scale guard: if a baseline target is not on the same scale as
+the supervised target, it remains a feature but is excluded from the residual
+trend. In the current files this is especially important for `AS`.
 
 Outputs:
 
@@ -158,4 +239,44 @@ python3 -m geo_transformer.evaluate \
   --sequence-length 256 \
   --max-sequences 20 \
   --device cuda
+```
+
+Autoregressive multi-order ensemble:
+
+```bash
+python3 -m geo_transformer.evaluate \
+  --prepared-dir geo_transformer/prepared_full \
+  --checkpoint geo_transformer/runs/full_multi_sched_residual/best_model.pt \
+  --output-dir geo_transformer/eval/full_multi_sched_residual_ar_ens \
+  --domain north \
+  --mode autoregressive \
+  --sequence-length 256 \
+  --max-sequences 50 \
+  --sample-sequences \
+  --ensemble-orders domain_strike,strike,random \
+  --device cuda
+```
+
+## Assay/block operators
+
+When geometry intersections are available, build normalized sparse operator tables:
+
+```bash
+python3 -m geo_transformer.build_operator \
+  --intersections assay_interval_node_intersections.csv \
+  --output geo_transformer/prepared/assay_operator.csv \
+  --operator-col interval_id \
+  --node-col node_id \
+  --measure-col intersection_length
+```
+
+For block aggregation:
+
+```bash
+python3 -m geo_transformer.build_operator \
+  --intersections block_node_intersections.csv \
+  --output geo_transformer/prepared/block_operator.csv \
+  --operator-col block_id \
+  --node-col node_id \
+  --measure-col intersection_volume
 ```

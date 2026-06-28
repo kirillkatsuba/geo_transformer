@@ -16,6 +16,7 @@ from .dataset import GeoSequenceDataset, collate_sequences
 from .losses import gaussian_nll
 from .model import GeoTransformer
 from .ordering import order_by_domain_then_strike, order_by_distance_to_data, order_by_strike, random_order
+from .target_baseline import add_scaled_target_baselines
 from .train_step import training_step
 
 try:
@@ -55,6 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prepared-dir", type=Path, default=Path("geo_transformer/prepared"))
     parser.add_argument("--output-dir", type=Path, default=Path("geo_transformer/runs/first"))
     parser.add_argument("--order", choices=["strike", "distance", "domain_strike", "random"], default="domain_strike")
+    parser.add_argument(
+        "--orders",
+        default="",
+        help="Comma-separated generation orders for multi-order training, e.g. domain_strike,strike,random.",
+    )
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--max-sequences", type=int, default=0, help="0 means use all sequences")
     parser.add_argument("--epochs", type=int, default=5)
@@ -65,6 +71,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-layers", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--val-fraction", type=float, default=0.1)
+    parser.add_argument(
+        "--val-mode",
+        choices=["sequence_random", "x_high", "x_low", "y_high", "y_low", "z_high", "z_low"],
+        default="sequence_random",
+        help="Validation split. Spatial modes hold out chunks by mean coordinate.",
+    )
+    parser.add_argument("--scheduled-sampling-prob", type=float, default=0.0)
+    parser.add_argument("--context-dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--target-baseline",
+        choices=["zero", "mean_baselines"],
+        default="zero",
+        help="Trend used for residual learning. mean_baselines averages attached v1/v2/dnn/gp target columns.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars")
@@ -106,12 +126,49 @@ def make_order(nodes: pd.DataFrame, order_name: str, seed: int) -> np.ndarray:
     raise ValueError(f"Unknown order {order_name!r}")
 
 
+def make_orders(nodes: pd.DataFrame, args: argparse.Namespace) -> list[tuple[str, np.ndarray]]:
+    order_names = [name.strip() for name in args.orders.split(",") if name.strip()]
+    if not order_names:
+        order_names = [args.order]
+    return [
+        (name, make_order(nodes, name, args.seed + idx))
+        for idx, name in enumerate(order_names)
+    ]
+
+
 def chunk_order(order: np.ndarray, sequence_length: int) -> list[np.ndarray]:
     return [
         order[start : start + sequence_length]
         for start in range(0, len(order), sequence_length)
         if len(order[start : start + sequence_length]) > 1
     ]
+
+
+def split_sequences(
+    nodes: pd.DataFrame,
+    sequences: list[np.ndarray],
+    val_fraction: float,
+    val_mode: str,
+    seed: int,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    if not sequences:
+        return [], []
+    val_count = max(1, int(len(sequences) * val_fraction))
+    if val_mode == "sequence_random":
+        rng = np.random.default_rng(seed)
+        seq_idx = np.arange(len(sequences))
+        rng.shuffle(seq_idx)
+        val_indices = set(seq_idx[:val_count].tolist())
+    else:
+        coord_col, side = val_mode.split("_", 1)
+        coord_col = coord_col.upper()
+        means = np.array([nodes.iloc[seq][coord_col].mean() for seq in sequences])
+        order = np.argsort(means)
+        chosen = order[-val_count:] if side == "high" else order[:val_count]
+        val_indices = set(chosen.tolist())
+    train_sequences = [seq for idx, seq in enumerate(sequences) if idx not in val_indices]
+    val_sequences = [seq for idx, seq in enumerate(sequences) if idx in val_indices]
+    return train_sequences, val_sequences
 
 
 def evaluate(
@@ -154,21 +211,31 @@ def main() -> None:
     scaled = scaler.transform(center, TARGET_COLUMNS)
     scaled_targets = [f"{target}_scaled" for target in TARGET_COLUMNS]
     center = pd.concat([center, scaled], axis=1)
-    for col in scaled_targets:
-        center[f"baseline_{col}"] = 0.0
+    center, target_baseline_columns = add_scaled_target_baselines(
+        center,
+        target_columns=TARGET_COLUMNS,
+        scaler=scaler.to_dict(),
+        mode=args.target_baseline,
+    )
+    if args.target_baseline != "zero":
+        print("Target baseline columns:")
+        for target, cols in target_baseline_columns.items():
+            print(f"  {target}: {', '.join(cols) if cols else '<none>'}")
 
-    order = make_order(center, args.order, args.seed)
-    sequences = chunk_order(order, args.sequence_length)
+    order_specs = make_orders(center, args)
+    sequences = []
+    for _, order in order_specs:
+        sequences.extend(chunk_order(order, args.sequence_length))
     if args.max_sequences and args.max_sequences > 0:
         sequences = sequences[: args.max_sequences]
 
-    rng = np.random.default_rng(args.seed)
-    seq_idx = np.arange(len(sequences))
-    rng.shuffle(seq_idx)
-    val_count = max(1, int(len(seq_idx) * args.val_fraction))
-    val_indices = set(seq_idx[:val_count].tolist())
-    train_sequences = [seq for idx, seq in enumerate(sequences) if idx not in val_indices]
-    val_sequences = [seq for idx, seq in enumerate(sequences) if idx in val_indices]
+    train_sequences, val_sequences = split_sequences(
+        center,
+        sequences,
+        args.val_fraction,
+        args.val_mode,
+        args.seed,
+    )
 
     train_dataset = GeoSequenceDataset(
         center,
@@ -212,6 +279,8 @@ def main() -> None:
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         max_epochs=args.epochs,
+        scheduled_sampling_prob=args.scheduled_sampling_prob,
+        context_dropout=args.context_dropout,
         target_columns=TARGET_COLUMNS,
     )
 
@@ -277,6 +346,10 @@ def main() -> None:
                     "scaled_target_columns": scaled_targets,
                     "target_scaler": scaler.to_dict(),
                     "order": args.order,
+                    "orders": [name for name, _ in order_specs],
+                    "val_mode": args.val_mode,
+                    "target_baseline": args.target_baseline,
+                    "target_baseline_columns": target_baseline_columns,
                     "sequence_length": args.sequence_length,
                     "epoch": epoch,
                     "val_loss": val_loss,

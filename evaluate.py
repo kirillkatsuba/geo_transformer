@@ -21,6 +21,7 @@ from .dataset import GeoSequenceDataset, collate_sequences
 from .inference import generate_autoregressive
 from .model import GeoTransformer
 from .ordering import order_by_domain_then_strike, order_by_distance_to_data, order_by_strike, random_order
+from .target_baseline import add_scaled_target_baselines
 
 try:
     from tqdm.auto import tqdm
@@ -41,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         help="teacher_forced is fast and optimistic; autoregressive is slower and closer to inference.",
     )
     parser.add_argument("--order", choices=["checkpoint", "strike", "distance", "domain_strike", "random"], default="checkpoint")
+    parser.add_argument(
+        "--ensemble-orders",
+        default="",
+        help="Comma-separated orders for AR ensemble, e.g. domain_strike,strike,random. Only for autoregressive mode.",
+    )
     parser.add_argument("--sequence-length", type=int, default=0, help="0 uses checkpoint sequence_length")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-sequences", type=int, default=0, help="0 means all sequences")
@@ -173,7 +179,13 @@ def predict_teacher_forced(
     scaler = checkpoint["target_scaler"]
     for target in TARGET_COLUMNS:
         work[f"{target}_scaled"] = (pd.to_numeric(work[target], errors="coerce") - scaler["mean"][target]) / scaler["std"][target]
-        work[f"baseline_{target}_scaled"] = 0.0
+    work, _ = add_scaled_target_baselines(
+        work,
+        target_columns=TARGET_COLUMNS,
+        scaler=scaler,
+        mode=checkpoint.get("target_baseline", "zero"),
+        allowed_columns=checkpoint.get("target_baseline_columns"),
+    )
 
     dataset = GeoSequenceDataset(
         work,
@@ -197,10 +209,11 @@ def predict_teacher_forced(
             attention_mask=batch["attention_mask"],
         )
         mu_np = mu.detach().cpu().numpy()
+        pred_np = mu_np + batch["baseline"].detach().cpu().numpy()
         valid_np = batch["attention_mask"].detach().cpu().numpy()
         for b in range(order.shape[0]):
             valid = valid_np[b]
-            pred_scaled[order[b, valid]] = mu_np[b, valid]
+            pred_scaled[order[b, valid]] = pred_np[b, valid]
     return pred_scaled
 
 
@@ -215,7 +228,16 @@ def predict_autoregressive(
     token_progress: bool,
 ) -> np.ndarray:
     feature_columns = checkpoint["feature_columns"]
-    conditions = torch.tensor(nodes[feature_columns].to_numpy(dtype=np.float32), device=device)
+    work, _ = add_scaled_target_baselines(
+        nodes,
+        target_columns=TARGET_COLUMNS,
+        scaler=checkpoint["target_scaler"],
+        mode=checkpoint.get("target_baseline", "zero"),
+        allowed_columns=checkpoint.get("target_baseline_columns"),
+    )
+    conditions = torch.tensor(work[feature_columns].to_numpy(dtype=np.float32), device=device)
+    baseline_columns = [f"baseline_{target}_scaled" for target in TARGET_COLUMNS]
+    baseline = torch.tensor(work[baseline_columns].to_numpy(dtype=np.float32), device=device)
     pred_scaled = np.full((len(nodes), len(TARGET_COLUMNS)), np.nan, dtype=np.float32)
     seq_iter = sequences
     if tqdm is not None and show_progress:
@@ -227,7 +249,7 @@ def predict_autoregressive(
             model=model,
             conditions=local_conditions,
             order=local_order,
-            baseline=None,
+            baseline=baseline[seq].detach().cpu(),
             sample=False,
             progress=token_progress,
             progress_desc=f"chunk {seq_idx + 1}/{len(sequences)} tokens",
@@ -311,15 +333,20 @@ def evaluate_domain(
 
     sequence_length = args.sequence_length or int(checkpoint.get("sequence_length", 512))
     order_name = checkpoint.get("order", "domain_strike") if args.order == "checkpoint" else args.order
-    order = make_order(nodes, order_name, args.seed)
-    sequences = chunk_order(order, sequence_length)
-    if args.max_sequences > 0:
-        if args.sample_sequences and len(sequences) > args.max_sequences:
-            rng = np.random.default_rng(args.seed)
-            selected = rng.choice(len(sequences), size=args.max_sequences, replace=False)
-            sequences = [sequences[int(idx)] for idx in selected]
-        else:
-            sequences = sequences[: args.max_sequences]
+
+    def make_sequences_for_order(name: str, seed_offset: int = 0) -> list[np.ndarray]:
+        order = make_order(nodes, name, args.seed + seed_offset)
+        seqs = chunk_order(order, sequence_length)
+        if args.max_sequences > 0:
+            if args.sample_sequences and len(seqs) > args.max_sequences:
+                rng = np.random.default_rng(args.seed + seed_offset)
+                selected = rng.choice(len(seqs), size=args.max_sequences, replace=False)
+                seqs = [seqs[int(idx)] for idx in selected]
+            else:
+                seqs = seqs[: args.max_sequences]
+        return seqs
+
+    sequences = make_sequences_for_order(order_name)
 
     print(
         f"{domain_name}: rows={len(nodes)}, sequences={len(sequences)}, "
@@ -336,15 +363,43 @@ def evaluate_domain(
             show_progress=not args.no_progress,
         )
     else:
-        pred_scaled = predict_autoregressive(
-            model=model,
-            nodes=nodes,
-            checkpoint=checkpoint,
-            sequences=sequences,
-            device=device,
-            show_progress=not args.no_progress,
-            token_progress=args.token_progress and not args.no_progress,
-        )
+        ensemble_order_names = [name.strip() for name in args.ensemble_orders.split(",") if name.strip()]
+        if ensemble_order_names:
+            preds = []
+            for idx, ens_order in enumerate(ensemble_order_names):
+                ens_sequences = make_sequences_for_order(ens_order, seed_offset=idx)
+                print(f"AR ensemble order {idx + 1}/{len(ensemble_order_names)}: {ens_order}")
+                preds.append(
+                    predict_autoregressive(
+                        model=model,
+                        nodes=nodes,
+                        checkpoint=checkpoint,
+                        sequences=ens_sequences,
+                        device=device,
+                        show_progress=not args.no_progress,
+                        token_progress=args.token_progress and not args.no_progress,
+                    )
+                )
+            stacked = np.stack(preds, axis=0)
+            finite = np.isfinite(stacked)
+            counts = finite.sum(axis=0)
+            sums = np.where(finite, stacked, 0.0).sum(axis=0)
+            pred_scaled = np.divide(
+                sums,
+                counts,
+                out=np.full_like(sums, np.nan, dtype=np.float32),
+                where=counts > 0,
+            )
+        else:
+            pred_scaled = predict_autoregressive(
+                model=model,
+                nodes=nodes,
+                checkpoint=checkpoint,
+                sequences=sequences,
+                device=device,
+                show_progress=not args.no_progress,
+                token_progress=args.token_progress and not args.no_progress,
+            )
 
     valid = np.isfinite(pred_scaled).all(axis=1)
     eval_frame = build_eval_frame(nodes.loc[valid].reset_index(drop=True), pred_scaled[valid], checkpoint, domain_name)
