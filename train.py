@@ -18,6 +18,11 @@ from .model import GeoTransformer
 from .ordering import order_by_domain_then_strike, order_by_distance_to_data, order_by_strike, random_order
 from .train_step import training_step
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - cluster fallback
+    tqdm = None
+
 
 class TargetStandardizer:
     """Mean/std target scaler saved with the checkpoint."""
@@ -62,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars")
     return parser.parse_args()
 
 
@@ -220,23 +226,40 @@ def main() -> None:
     best_val = float("inf")
     best_path = args.output_dir / "best_model.pt"
 
-    for epoch in range(1, args.epochs + 1):
+    epoch_iter = range(1, args.epochs + 1)
+    if tqdm is not None and not args.no_progress:
+        epoch_iter = tqdm(epoch_iter, desc="epochs", position=0)
+
+    for epoch in epoch_iter:
         model.train()
         train_losses = []
-        for batch in train_loader:
+        batch_iter = train_loader
+        if tqdm is not None and not args.no_progress:
+            batch_iter = tqdm(
+                train_loader,
+                desc=f"epoch {epoch}/{args.epochs}",
+                leave=False,
+                position=1,
+            )
+        for batch in batch_iter:
             batch = {key: value.to(device) for key, value in batch.items()}
             optimizer.zero_grad(set_to_none=True)
             losses = training_step(model, batch, training_config)
             losses["loss"].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), training_config.gradient_clip_norm)
             optimizer.step()
-            train_losses.append(float(losses["loss"].detach().cpu()))
+            batch_loss = float(losses["loss"].detach().cpu())
+            train_losses.append(batch_loss)
+            if tqdm is not None and not args.no_progress:
+                batch_iter.set_postfix(loss=f"{batch_loss:.4f}")
 
         train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
         val_loss = evaluate(model, val_loader, device)
         row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss}
         metrics.append(row)
         print(f"epoch={epoch} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
+        if tqdm is not None and not args.no_progress:
+            epoch_iter.set_postfix(train=f"{train_loss:.4f}", val=f"{val_loss:.4f}")
 
         if val_loss < best_val:
             best_val = val_loss
