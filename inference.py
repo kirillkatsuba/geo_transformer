@@ -14,6 +14,8 @@ def generate_autoregressive(
     baseline: torch.Tensor | None = None,
     sample: bool = True,
     temperature: float = 1.0,
+    progress: bool = False,
+    progress_desc: str = "ar tokens",
 ) -> torch.Tensor:
     """Generate targets in a given order.
 
@@ -37,7 +39,16 @@ def generate_autoregressive(
     attention_mask = torch.ones(1, n_nodes, dtype=torch.bool, device=device)
     assay_batch = assay_tokens.to(device).unsqueeze(0) if assay_tokens is not None else None
 
-    for pos in range(n_nodes):
+    iterator = range(n_nodes)
+    if progress:
+        try:
+            from tqdm.auto import tqdm
+
+            iterator = tqdm(iterator, desc=progress_desc, leave=False)
+        except ImportError:
+            pass
+
+    for pos in iterator:
         mu, log_sigma = model(
             conditions=ordered_conditions[:, : pos + 1],
             prev_targets=generated_ordered[:, : pos + 1],
@@ -84,4 +95,3 @@ def generate_multiple_realizations(
         for order in orders
     ]
     return torch.stack(realizations, dim=0)
-

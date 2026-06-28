@@ -22,6 +22,11 @@ from .inference import generate_autoregressive
 from .model import GeoTransformer
 from .ordering import order_by_domain_then_strike, order_by_distance_to_data, order_by_strike, random_order
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - cluster fallback
+    tqdm = None
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate GeoTransformer on CEN/NTH known blocks.")
@@ -39,9 +44,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-length", type=int, default=0, help="0 uses checkpoint sequence_length")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-sequences", type=int, default=0, help="0 means all sequences")
+    parser.add_argument(
+        "--sample-sequences",
+        action="store_true",
+        help="When max-sequences is set, sample chunks randomly instead of taking the first chunks.",
+    )
     parser.add_argument("--max-plot-points", type=int, default=60000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars")
+    parser.add_argument(
+        "--token-progress",
+        action="store_true",
+        help="Show inner token progress for autoregressive generation. Verbose but useful for long single chunks.",
+    )
     return parser.parse_args()
 
 
@@ -149,6 +165,7 @@ def predict_teacher_forced(
     sequences: list[np.ndarray],
     device: torch.device,
     batch_size: int,
+    show_progress: bool,
 ) -> np.ndarray:
     feature_columns = checkpoint["feature_columns"]
     scaled_targets = checkpoint["scaled_target_columns"]
@@ -168,7 +185,10 @@ def predict_teacher_forced(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_sequences)
     pred_scaled = np.full((len(nodes), len(TARGET_COLUMNS)), np.nan, dtype=np.float32)
 
-    for batch in loader:
+    batch_iter = loader
+    if tqdm is not None and show_progress:
+        batch_iter = tqdm(loader, desc="teacher-forced batches", leave=False)
+    for batch in batch_iter:
         order = batch["order"].cpu().numpy()
         batch = {key: value.to(device) for key, value in batch.items() if key != "order"}
         mu, _ = model(
@@ -191,11 +211,16 @@ def predict_autoregressive(
     checkpoint: dict,
     sequences: list[np.ndarray],
     device: torch.device,
+    show_progress: bool,
+    token_progress: bool,
 ) -> np.ndarray:
     feature_columns = checkpoint["feature_columns"]
     conditions = torch.tensor(nodes[feature_columns].to_numpy(dtype=np.float32), device=device)
     pred_scaled = np.full((len(nodes), len(TARGET_COLUMNS)), np.nan, dtype=np.float32)
-    for seq in sequences:
+    seq_iter = sequences
+    if tqdm is not None and show_progress:
+        seq_iter = tqdm(sequences, desc="autoregressive chunks")
+    for seq_idx, seq in enumerate(seq_iter):
         local_conditions = conditions[seq].detach().cpu()
         local_order = torch.arange(len(seq), dtype=torch.long)
         generated = generate_autoregressive(
@@ -204,6 +229,8 @@ def predict_autoregressive(
             order=local_order,
             baseline=None,
             sample=False,
+            progress=token_progress,
+            progress_desc=f"chunk {seq_idx + 1}/{len(sequences)} tokens",
         )
         pred_scaled[seq] = generated.detach().cpu().numpy()
     return pred_scaled
@@ -287,7 +314,12 @@ def evaluate_domain(
     order = make_order(nodes, order_name, args.seed)
     sequences = chunk_order(order, sequence_length)
     if args.max_sequences > 0:
-        sequences = sequences[: args.max_sequences]
+        if args.sample_sequences and len(sequences) > args.max_sequences:
+            rng = np.random.default_rng(args.seed)
+            selected = rng.choice(len(sequences), size=args.max_sequences, replace=False)
+            sequences = [sequences[int(idx)] for idx in selected]
+        else:
+            sequences = sequences[: args.max_sequences]
 
     print(
         f"{domain_name}: rows={len(nodes)}, sequences={len(sequences)}, "
@@ -301,6 +333,7 @@ def evaluate_domain(
             sequences=sequences,
             device=device,
             batch_size=args.batch_size,
+            show_progress=not args.no_progress,
         )
     else:
         pred_scaled = predict_autoregressive(
@@ -309,6 +342,8 @@ def evaluate_domain(
             checkpoint=checkpoint,
             sequences=sequences,
             device=device,
+            show_progress=not args.no_progress,
+            token_progress=args.token_progress and not args.no_progress,
         )
 
     valid = np.isfinite(pred_scaled).all(axis=1)
