@@ -257,7 +257,11 @@ def main() -> None:
         val_loss = evaluate(model, val_loader, device)
         row = {"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss}
         metrics.append(row)
-        print(f"epoch={epoch} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
+        epoch_message = f"epoch={epoch} train_loss={train_loss:.6f} val_loss={val_loss:.6f}"
+        if tqdm is not None and not args.no_progress:
+            tqdm.write(epoch_message)
+        else:
+            print(epoch_message)
         if tqdm is not None and not args.no_progress:
             epoch_iter.set_postfix(train=f"{train_loss:.4f}", val=f"{val_loss:.4f}")
 
