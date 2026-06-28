@@ -125,3 +125,37 @@ Outputs:
 - `best_model.pt` - checkpoint with model weights, feature schema and target scaler.
 - `metrics.csv` - train/validation loss by epoch.
 - `run_config.json` - command configuration.
+
+## Evaluate and visualize
+
+Fast teacher-forced evaluation on center and known northern blocks:
+
+```bash
+python3 -m geo_transformer.evaluate \
+  --prepared-dir geo_transformer/prepared \
+  --checkpoint geo_transformer/runs/center_v1/best_model.pt \
+  --output-dir geo_transformer/eval/center_v1 \
+  --domain both \
+  --mode teacher_forced \
+  --device cuda
+```
+
+This writes, per domain:
+
+- `predictions.csv` - true/pred/error per target.
+- `metrics.csv` - MAE, RMSE, R2, MAPE and bias.
+- `plots/xy_<TARGET>.png` - XY maps for true, prediction and error.
+
+Autoregressive evaluation is slower but closer to real inference:
+
+```bash
+python3 -m geo_transformer.evaluate \
+  --prepared-dir geo_transformer/prepared \
+  --checkpoint geo_transformer/runs/center_v1/best_model.pt \
+  --output-dir geo_transformer/eval/center_v1_ar \
+  --domain north \
+  --mode autoregressive \
+  --sequence-length 256 \
+  --max-sequences 20 \
+  --device cuda
+```
